@@ -1,32 +1,22 @@
-// config.js
-module.exports = {
-  token: "DISCORD_BOT_TOKEN",
+{
+  "token": "MTMzNTI3NTI0MTUxNzIyMzkzNg.GDdG9v.3LsP8tZVdVQhFl3H2QcDXEDdKMKgG8LcDKFkUM",
+  "guildId": "1444323528236208260",
+  "reviewChannelId": "1444337505292914860",
+  "reviewerUserId": "609779007621431336",
+  "targetUserId": "1318594221204308039",
 
-  guildId: "1444323528236208260",
-  reviewChannelId: "1444337505292914860",       // Nur hier wird gepostet
-  reviewerUserId: "609779007621431336",  // Nur diese Person darf ausfüllen
-  targetUserId: "1318594221204308039",   // Diese Person bekommt das Ergebnis per DM
-
-  // Europa/Berlin: node-cron arbeitet standardmäßig in Server-Zeit.
-  // Wenn dein Server nicht in Europe/Berlin läuft, setze TZ in deiner Umgebung:
-  // Linux: export TZ=Europe/Berlin
-  cron: {
-    dailyPost: "30 20 * * *",      // 20:30
-    reminder1: "45 20 * * *",      // 20:45
-    reminder2: "00 21 * * *",      // 21:00
-    reminder3: "30 21 * * *",      // 21:30
-    autoClose: "59 23 * * *"       // 23:59
+  "cron": {
+    "dailyPost": "30 20 * * *",
+    "reminder1": "45 20 * * *",
+    "reminder2": "00 21 * * *",
+    "reminder3": "30 21 * * *",
+    "autoClose": "59 23 * * *"
   },
 
-  // Verhalten
-  behavior: {
-    pingReviewerInChannelOnStart: false,
-    pingReviewerInChannelOnReminders: false,
-
-    // Wenn nicht fertig: DMs an Bewerter
-    dmReminders: true,
-
-    // Wenn autoClose greift und nicht fertig: DM an Target mit "unvollständig"?
-    dmTargetOnIncompleteClose: false
+  "behavior": {
+    "pingReviewerInChannelOnStart": false,
+    "pingReviewerInChannelOnReminders": false,
+    "dmReminders": true,
+    "dmTargetOnIncompleteClose": false
   }
-};
+}
