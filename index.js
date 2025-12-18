@@ -1,534 +1,407 @@
-const cron = require("node-cron");
-const {
+/**
+ * Multi-Region Topic News Bot (single-file)
+ * - Pulls RSS feeds
+ * - Clusters items by topic
+ * - Posts one embed per topic per region to dedicated channels
+ * - Dedup with persistent state.json
+ *
+ * Node 18+, discord.js v14
+ */
+
+import fs from "fs";
+import cron from "node-cron";
+import Parser from "rss-parser";
+import { fetch as undiciFetch } from "undici";
+import {
   Client,
   GatewayIntentBits,
   EmbedBuilder,
-  ActionRowBuilder,
-  StringSelectMenuBuilder,
-  PermissionsBitField
-} = require("discord.js");
+  REST,
+  Routes,
+  SlashCommandBuilder
+} from "discord.js";
 
-const config = require("./config");
-const { loadState, saveState } = require("./storage");
+/* =========================
+   CONFIG (EDIT THIS)
+========================= */
+const CONFIG = {
+  token: "DEIN_BOT_TOKEN",
+  // pro Region ein Channel (du kannst beliebig viele hinzufügen/ändern)
+  channels: {
+    DE: "1444337505292914860",
+    IT: "CHANNEL_ID_IT",
+    ES: "CHANNEL_ID_ES",
+    UK: "CHANNEL_ID_UK",
+    NATO: "CHANNEL_ID_NATO",
+    GR: "CHANNEL_ID_GR",
+    HR: "CHANNEL_ID_HR"
+  },
 
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.DirectMessages
-  ]
-});
+  // Cron: alle 20 Minuten (stell’s ein wie du willst)
+  schedule: "*/20 * * * *",
 
-const QUESTIONS = [
-  "Wie aktiv war die Person heute?",
-  "War sie romantisch genug?",
-  "Hast du genug Aufmerksamkeit bekommen?",
-  "Emotionale Nähe heute?",
-  "Kommunikation (Qualität & Klarheit)?",
-  "Initiative gezeigt?",
-  "Interesse an dir spürbar?",
-  "Zeit für dich genommen?",
-  "Zuverlässigkeit & Verbindlichkeit?",
-  "Gesamteindruck des Tages?"
-];
+  // pro Region: wie viele neue Items max. pro Pull verarbeiten
+  maxItemsPerRegion: 20,
 
-const DESCRIPTIONS = {
-  1: "Sehr schlecht",
-  2: "Schlecht",
-  3: "Okay",
-  4: "Gut",
-  5: "Sehr gut"
+  // pro Topic: wie viele Headlines in ein Embed
+  maxHeadlinesPerTopic: 4,
+
+  // Nur neue Artikel seit X Stunden (reduziert Spam)
+  onlySinceHours: 24,
+
+  // Wenn true: Postet auch dann, wenn sich Themen leicht überschneiden (aggressiver)
+  aggressivePosting: false
 };
 
-function todayKey() {
-  // YYYY-MM-DD (lokal). Für Berlin-Genauigkeit: Server TZ auf Europe/Berlin setzen.
-  const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
+/* =========================
+   FEEDS
+   (RSS-URLs können sich ändern – hier sind robuste Startpunkte)
+========================= */
+const FEEDS = {
+  DE: [
+    { source: "Tagesschau", url: "https://www.tagesschau.de/xml/rss2" },
+    { source: "WELT", url: "https://www.welt.de/feeds/latest.rss" }
+  ],
+  IT: [
+    // ANSA: die Kategorien stehen auf der offiziellen RSS-Seite
+    // Du kannst hier weitere ANSA-Feeds ergänzen (Politica, Mondo, Economia, etc.)
+    { source: "ANSA Top News", url: "https://www.ansa.it/sito/notizie/topnews/topnews_rss.xml" }
+  ],
+  ES: [
+    // RTVE: je nach Feed-Endpoint kann es 400/403 geben -> wir senden User-Agent + Accept
+    { source: "RTVE Noticias", url: "https://www.rtve.es/rss/temas_noticias.xml" },
+    // EL PAÍS (ultimas-noticias): Endpoint kann je nach Region/UA empfindlich sein
+    { source: "EL PAÍS Últimas", url: "https://feeds.elpais.com/mrss-s/pages/ep/site/elpais.com/section/ultimas-noticias/portada" }
+  ],
+  UK: [
+    { source: "BBC UK", url: "http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/front_page/rss.xml" },
+    { source: "BBC Politics", url: "http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/uk_politics/rss.xml" }
+  ],
+  NATO: [
+    { source: "NATO Watch", url: "https://natowatch.org/news.xml" }
+  ],
+  GR: [
+    // Falls du später eine direkte eKathimerini RSS-URL hast, einfach ergänzen:
+    // { source: "eKathimerini", url: "..." }
+    // Stabiler Fallback (PressDisplay liefert RSS-Endpoints, kann Paywall/Limit haben)
+    { source: "Kathimerini English (PressDisplay)", url: "https://www.pressdisplay.com/pressdisplay/services/rss.ashx?cid=1142&type=full" }
+  ],
+  HR: [
+    // Kroatische Regierung (English)
+    { source: "Gov.hr (EN)", url: "https://vlada.gov.hr/rss.aspx?ID=14956" },
+    // HRT: wenn verfügbar; ansonsten fällt der Bot nicht um, sondern nutzt andere Feeds
+    { source: "HRT Latest (fallback)", url: "https://feed.hrt.hr/vijesti/latest.xml" }
+  ]
+};
+
+/* =========================
+   TOPIC MODEL (Heuristik, aber “geil formatiert”)
+========================= */
+const TOPICS = [
+  { key: "SECURITY_DEFENSE", name: "Sicherheit & Verteidigung", keywords: ["nato", "militär", "armee", "rakete", "angriff", "krieg", "verteidigung", "rüstung", "cyber", "terror"] },
+  { key: "POLITICS", name: "Politik", keywords: ["regierung", "parlament", "wahl", "minister", "koalition", "präsident", "kanzler", "gesetz", "abstimmung", "opposition"] },
+  { key: "ECONOMY", name: "Wirtschaft", keywords: ["wirtschaft", "inflation", "rezession", "börse", "aktie", "zins", "eur", "haushalt", "konjunktur", "unternehmen"] },
+  { key: "MIGRATION", name: "Migration & Gesellschaft", keywords: ["migration", "flüchtling", "asyl", "grenze", "integration", "protest", "streik", "kriminalität"] },
+  { key: "ENERGY_CLIMATE", name: "Energie & Klima", keywords: ["energie", "strom", "gas", "klima", "co2", "wetter", "hitze", "flut", "dürre", "erneuerbar"] },
+  { key: "TECH_SCIENCE", name: "Tech & Wissenschaft", keywords: ["ki", "ai", "software", "chip", "cyber", "forschung", "impf", "medizin", "raumfahrt", "wissenschaft"] },
+  { key: "OTHER", name: "Weitere Themen", keywords: [] }
+];
+
+function normalizeText(s) {
+  return (s || "")
+    .toString()
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
 }
 
-function stars(n) {
-  return "⭐".repeat(Math.max(0, Math.min(5, Number(n) || 0)));
-}
-
-function clamp1to5(n) {
-  const x = Number(n);
-  if (!Number.isFinite(x)) return null;
-  if (x < 1 || x > 5) return null;
-  return x;
-}
-
-function freshDailyState(state) {
-  const key = todayKey();
-  if (!state.daily || state.daily.date !== key) {
-    state.daily = {
-      date: key,
-      started: false,
-      completed: false,
-      startedAt: null,
-      completedAt: null,
-      // answers: array length 10, values 1..5 or null
-      answers: Array(QUESTIONS.length).fill(null),
-      messages: {
-        introMessageId: null,
-        questionMessageIds: Array(QUESTIONS.length).fill(null)
-      },
-      reminder: {
-        r1: false,
-        r2: false,
-        r3: false
-      }
-    };
+function pickTopic(item) {
+  const hay = normalizeText(`${item.title} ${item.contentSnippet || ""}`);
+  for (const t of TOPICS) {
+    if (t.key === "OTHER") continue;
+    for (const kw of t.keywords) {
+      if (hay.includes(kw)) return t.key;
+    }
   }
-  return state;
+  return "OTHER";
 }
 
-async function safeFetchChannel() {
-  const guild = await client.guilds.fetch(config.guildId);
-  const channel = await guild.channels.fetch(config.reviewChannelId);
-  return { guild, channel };
+function shortSummary(text, maxLen = 220) {
+  const clean = (text || "").replace(/\s+/g, " ").trim();
+  if (!clean) return "Kurzfazit: Noch keine saubere Vorschau im Feed.";
+  return clean.length > maxLen ? clean.slice(0, maxLen - 1) + "…" : clean;
 }
 
-function isReviewer(userId) {
-  return userId === config.reviewerUserId;
+function whyItMatters(topicKey) {
+  // Mini-“Value add” pro Thema (macht’s deutlich “geiler” als nur Headlines)
+  switch (topicKey) {
+    case "SECURITY_DEFENSE": return "Warum relevant: kann direkte Auswirkungen auf Sicherheitslage, Beschlüsse und Bündnispolitik haben.";
+    case "POLITICS": return "Warum relevant: beeinflusst kurzfristig Entscheidungen, Budgets und die innenpolitische Lage.";
+    case "ECONOMY": return "Warum relevant: kann Preise, Märkte, Jobs und Investitionsklima direkt bewegen.";
+    case "MIGRATION": return "Warum relevant: wirkt auf gesellschaftliche Debatten, Behörden, Kapazitäten und politische Entscheidungen.";
+    case "ENERGY_CLIMATE": return "Warum relevant: betrifft Kosten, Versorgungssicherheit und regulatorische Maßnahmen.";
+    case "TECH_SCIENCE": return "Warum relevant: beeinflusst Innovation, Wettbewerbsfähigkeit und Regulierung.";
+    default: return "Warum relevant: laufende Entwicklung – kann Folgeeffekte in mehreren Bereichen haben.";
+  }
 }
 
-function buildIntroEmbed(state) {
-  const d = state.daily;
-  const status = d.completed ? "✅ Abgeschlossen" : (d.started ? "🟡 Läuft" : "⚪ Nicht gestartet");
-  const answered = d.answers.filter(v => v !== null).length;
-
-  return new EmbedBuilder()
-    .setTitle("📝 Daily Relationship Review")
-    .setDescription(
-      [
-        `Datum: **${d.date}**`,
-        `Status: **${status}**`,
-        `Fortschritt: **${answered}/${QUESTIONS.length}**`,
-        "",
-        "Bewerte jede Frage über das Select-Menu (⭐ 1–5).",
-        "Sobald alles beantwortet ist, wird automatisch ausgewertet und per DM versendet."
-      ].join("\n")
-    )
-    .setColor(0xE91E63)
-    .setFooter({ text: "Zugriff: Nur autorisierter Bewerter & nur im festgelegten Channel." })
-    .setTimestamp();
-}
-
-function buildQuestionEmbed(i) {
-  return new EmbedBuilder()
-    .setTitle(`Frage ${i + 1}/${QUESTIONS.length}`)
-    .setDescription(QUESTIONS[i])
-    .setColor(0xE91E63)
-    .setFooter({ text: "Wähle 1–5 Sterne" });
-}
-
-function buildSelectRow(i) {
-  return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId(`review_${i}`)
-      .setPlaceholder("Bewertung auswählen")
-      .addOptions([1, 2, 3, 4, 5].map(n => ({
-        label: `${stars(n)} (${n}/5)`,
-        value: String(n),
-        description: DESCRIPTIONS[n]
-      })))
-  );
-}
-
-function buildResultEmbed(state, avg) {
-  const d = state.daily;
-  const roundedAvg = Math.round(avg);
-
-  const fields = QUESTIONS.map((q, i) => {
-    const val = d.answers[i];
-    return {
-      name: q,
-      value: val ? `${stars(val)} (**${val}/5**) — ${DESCRIPTIONS[val]}` : "—",
-      inline: false
-    };
-  });
-
-  fields.push({
-    name: "📊 Durchschnitt",
-    value: `${stars(roundedAvg)} (**${avg.toFixed(2)}/5**)`,
-    inline: false
-  });
-
-  // Simple “Highlights”
-  const max = Math.max(...d.answers.filter(v => v !== null));
-  const min = Math.min(...d.answers.filter(v => v !== null));
-  const bestIdx = d.answers.findIndex(v => v === max);
-  const worstIdx = d.answers.findIndex(v => v === min);
-
-  fields.push({
-    name: "🔎 Highlights",
-    value: [
-      `Top: **${QUESTIONS[bestIdx]}** → ${stars(max)} (${max}/5)`,
-      `Low: **${QUESTIONS[worstIdx]}** → ${stars(min)} (${min}/5)`
-    ].join("\n"),
-    inline: false
-  });
-
-  return new EmbedBuilder()
-    .setTitle("💖 Tages-Auswertung")
-    .setDescription(`Datum: **${d.date}**`)
-    .setColor(0xE91E63)
-    .addFields(fields)
-    .setTimestamp();
-}
-
-async function sendReminderDM(state, which) {
-  if (!config.behavior.dmReminders) return;
-
-  const d = state.daily;
-  if (!d.started || d.completed) return;
-
-  const answered = d.answers.filter(v => v !== null).length;
-  const missing = QUESTIONS.length - answered;
-
-  const embed = new EmbedBuilder()
-    .setTitle("⏰ Erinnerung: Daily Review offen")
-    .setDescription(
-      [
-        `Datum: **${d.date}**`,
-        `Fortschritt: **${answered}/${QUESTIONS.length}**`,
-        `Offen: **${missing}**`,
-        "",
-        "Bitte im vorgesehenen Channel die fehlenden Fragen beantworten."
-      ].join("\n")
-    )
-    .setColor(0xFF9800)
-    .setFooter({ text: `Reminder ${which}` })
-    .setTimestamp();
-
+/* =========================
+   STATE (persist dedup)
+========================= */
+const STATE_FILE = "./state.json";
+function loadState() {
   try {
-    const reviewer = await client.users.fetch(config.reviewerUserId);
-    await reviewer.send({ embeds: [embed] });
+    const raw = fs.readFileSync(STATE_FILE, "utf8");
+    return JSON.parse(raw);
   } catch {
-    // DM kann deaktiviert sein – ignorieren.
+    return { seen: {} }; // seen[region] = { id: timestamp }
+  }
+}
+function saveState(state) {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), "utf8");
+}
+function makeItemId(item) {
+  // stabiler Fingerprint
+  return (item.guid || item.id || item.link || item.title || "")
+    .toString()
+    .trim();
+}
+function pruneOld(state, hours = 72) {
+  const cutoff = Date.now() - hours * 3600 * 1000;
+  for (const region of Object.keys(state.seen || {})) {
+    for (const id of Object.keys(state.seen[region] || {})) {
+      if (state.seen[region][id] < cutoff) delete state.seen[region][id];
+    }
   }
 }
 
-async function maybePingInChannel(text) {
-  if (!text) return;
-  const { channel } = await safeFetchChannel();
-  await channel.send({ content: text });
-}
-
-async function startDailyReview(state, initiatedBy = "cron") {
-  state = freshDailyState(state);
-  const d = state.daily;
-
-  if (d.started) return { ok: false, reason: "already_started" };
-
-  const { channel } = await safeFetchChannel();
-
-  d.started = true;
-  d.startedAt = new Date().toISOString();
-
-  // Intro
-  const intro = await channel.send({ embeds: [buildIntroEmbed(state)] });
-  d.messages.introMessageId = intro.id;
-
-  if (config.behavior.pingReviewerInChannelOnStart) {
-    await maybePingInChannel(`<@${config.reviewerUserId}> Daily Review ist bereit.`);
+/* =========================
+   RSS PARSER with robust fetch
+========================= */
+const parser = new Parser({
+  customFields: {
+    item: ["media:content", "content:encoded", "dc:creator"]
   }
+});
 
-  // Fragen
-  for (let i = 0; i < QUESTIONS.length; i++) {
-    const msg = await channel.send({
-      embeds: [buildQuestionEmbed(i)],
-      components: [buildSelectRow(i)]
-    });
-    d.messages.questionMessageIds[i] = msg.id;
-  }
-
-  saveState(state);
-  return { ok: true, initiatedBy };
+// Some feeds are picky (400/403 unless UA/Accept are present)
+async function fetchWithHeaders(url) {
+  const res = await undiciFetch(url, {
+    headers: {
+      "user-agent": "Mozilla/5.0 (NewsBot; +https://discord.com)",
+      "accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7"
+    }
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+  return await res.text();
 }
 
-async function completeIfReady(state) {
-  const d = state.daily;
-  if (!d.started || d.completed) return;
-
-  const answered = d.answers.filter(v => v !== null).length;
-  if (answered !== QUESTIONS.length) return;
-
-  const sum = d.answers.reduce((a, b) => a + b, 0);
-  const avg = sum / QUESTIONS.length;
-
-  const resultEmbed = buildResultEmbed(state, avg);
-
-  // DM an Target
-  const target = await client.users.fetch(config.targetUserId);
-  await target.send({ embeds: [resultEmbed] });
-
-  d.completed = true;
-  d.completedAt = new Date().toISOString();
-
-  // Optional: Abschluss-Notice im Channel
-  const { channel } = await safeFetchChannel();
-  const doneEmbed = new EmbedBuilder()
-    .setTitle("✅ Review abgeschlossen")
-    .setDescription("Auswertung wurde erfolgreich per DM versendet.")
-    .setColor(0x4CAF50)
-    .setTimestamp();
-  await channel.send({ embeds: [doneEmbed] });
-
-  saveState(state);
+async function parseFeed(url) {
+  // rss-parser parseURL uses its own request; we override by pulling ourselves and parseString
+  const xml = await fetchWithHeaders(url);
+  return await parser.parseString(xml);
 }
 
-async function autoCloseIfOpen(state) {
-  state = freshDailyState(state);
-  const d = state.daily;
-  if (!d.started || d.completed) return;
+/* =========================
+   DISCORD
+========================= */
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-  const answered = d.answers.filter(v => v !== null).length;
-  const missingIdx = d.answers
-    .map((v, i) => (v === null ? i : null))
-    .filter(v => v !== null);
-
-  const embed = new EmbedBuilder()
-    .setTitle("🛑 Daily Review automatisch geschlossen")
-    .setDescription(
-      [
-        `Datum: **${d.date}**`,
-        `Fortschritt: **${answered}/${QUESTIONS.length}**`,
-        "",
-        missingIdx.length
-          ? `Offene Fragen:\n${missingIdx.map(i => `• ${i + 1}) ${QUESTIONS[i]}`).join("\n")}`
-          : "Keine offenen Fragen."
-      ].join("\n")
+const commands = [
+  new SlashCommandBuilder()
+    .setName("news")
+    .setDescription("Poste jetzt die neuesten News (pro Region/Channel).")
+    .addStringOption(o =>
+      o.setName("region")
+        .setDescription("Optional: DE/IT/ES/UK/NATO/GR/HR oder ALL")
+        .setRequired(false)
     )
-    .setColor(0x9E9E9E)
-    .setTimestamp();
+].map(c => c.toJSON());
 
-  // DM an Reviewer
-  try {
-    const reviewer = await client.users.fetch(config.reviewerUserId);
-    await reviewer.send({ embeds: [embed] });
-  } catch {}
+async function registerCommands() {
+  const rest = new REST({ version: "10" }).setToken(CONFIG.token);
+  const appId = client.user.id;
+  await rest.put(Routes.applicationCommands(appId), { body: commands });
+}
 
-  // Optional: DM an Target
-  if (config.behavior.dmTargetOnIncompleteClose) {
+function regionColor(region) {
+  const map = { DE: 0x1f8b4c, IT: 0x2ecc71, ES: 0xe67e22, UK: 0x3498db, NATO: 0x9b59b6, GR: 0x2980b9, HR: 0xe74c3c };
+  return map[region] ?? 0x2f3136;
+}
+
+function regionTitle(region) {
+  const map = { DE: "Deutschland", IT: "Italien", ES: "Spanien", UK: "England / UK", NATO: "NATO", GR: "Griechenland", HR: "Kroatien" };
+  return map[region] ?? region;
+}
+
+/* =========================
+   CORE: collect -> cluster -> post
+========================= */
+async function collectRegion(region) {
+  const feeds = FEEDS[region] || [];
+  const items = [];
+  for (const f of feeds) {
     try {
-      const target = await client.users.fetch(config.targetUserId);
-      await target.send({ embeds: [embed] });
-    } catch {}
+      const data = await parseFeed(f.url);
+      for (const it of (data.items || []).slice(0, CONFIG.maxItemsPerRegion)) {
+        items.push({
+          region,
+          source: f.source,
+          title: it.title || "(ohne Titel)",
+          link: it.link,
+          pubDate: it.isoDate ? new Date(it.isoDate).getTime() : (it.pubDate ? new Date(it.pubDate).getTime() : Date.now()),
+          contentSnippet: it.contentSnippet || it.content || ""
+        });
+      }
+    } catch (e) {
+      console.error(`[${region}] Feed error (${f.source}):`, e.message);
+    }
+  }
+  // Sort newest first
+  items.sort((a, b) => b.pubDate - a.pubDate);
+  return items;
+}
+
+function filterNew(items, state, region) {
+  const seen = (state.seen[region] ||= {});
+  const cutoff = Date.now() - CONFIG.onlySinceHours * 3600 * 1000;
+
+  const fresh = [];
+  for (const it of items) {
+    if (!it.link) continue;
+    if (it.pubDate < cutoff) continue;
+
+    const id = makeItemId(it);
+    if (!id) continue;
+
+    if (!seen[id]) {
+      fresh.push(it);
+    }
+  }
+  return fresh;
+}
+
+function markSeen(state, region, items) {
+  const seen = (state.seen[region] ||= {});
+  for (const it of items) {
+    const id = makeItemId(it);
+    if (id) seen[id] = Date.now();
+  }
+}
+
+function clusterByTopic(items) {
+  const groups = new Map(); // topicKey -> items
+  for (const it of items) {
+    const tk = pickTopic(it);
+    if (!groups.has(tk)) groups.set(tk, []);
+    groups.get(tk).push(it);
+  }
+  // sort inside each topic
+  for (const [k, arr] of groups.entries()) {
+    arr.sort((a, b) => b.pubDate - a.pubDate);
+    groups.set(k, arr);
+  }
+  return groups;
+}
+
+async function postRegion(region, forcedChannelId = null) {
+  const channelId = forcedChannelId || CONFIG.channels[region];
+  if (!channelId) return;
+
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+  if (!channel) return;
+
+  const state = loadState();
+  pruneOld(state, 96);
+
+  const collected = await collectRegion(region);
+  const fresh = filterNew(collected, state, region);
+
+  if (!fresh.length && !CONFIG.aggressivePosting) return;
+
+  const clusters = clusterByTopic(fresh.length ? fresh : collected.slice(0, 10));
+  const topicKeys = Array.from(clusters.keys());
+
+  // Post one embed per topic (only if there is content)
+  for (const topicKey of topicKeys) {
+    const topic = TOPICS.find(t => t.key === topicKey) || TOPICS.find(t => t.key === "OTHER");
+    const arr = clusters.get(topicKey) || [];
+    if (!arr.length) continue;
+
+    const top = arr.slice(0, CONFIG.maxHeadlinesPerTopic);
+
+    const lines = top.map((x, idx) => {
+      const sum = shortSummary(x.contentSnippet, 160);
+      // Markdown “nice”: headline clickable, one-liner summary
+      return `**${idx + 1}. [${x.title}](${x.link})**\n${sum}\n_Quelle: ${x.source}_`;
+    });
+
+    const newest = new Date(top[0].pubDate).toLocaleString("de-DE", { timeZone: "Europe/Berlin" });
+
+    const embed = new EmbedBuilder()
+      .setTitle(`${regionTitle(region)} — ${topic.name}`)
+      .setDescription(`${lines.join("\n\n")}\n\n${whyItMatters(topicKey)}`)
+      .setColor(regionColor(region))
+      .setFooter({ text: `Aktualisiert: ${newest}` })
+      .setTimestamp(new Date());
+
+    await channel.send({ embeds: [embed] }).catch(console.error);
   }
 
-  // Markiere als "abgeschlossen" um keine weiteren Reminders zu senden
-  d.completed = true;
-  d.completedAt = new Date().toISOString();
+  // Mark seen only for truly fresh, so “ALL” doesn’t burn backlog
+  if (fresh.length) markSeen(state, region, fresh);
   saveState(state);
 }
 
-let STATE = loadState();
-STATE = freshDailyState(STATE);
-saveState(STATE);
+async function postAllRegions() {
+  const regions = Object.keys(CONFIG.channels);
+  for (const r of regions) {
+    await postRegion(r);
+  }
+}
 
+/* =========================
+   BOOT
+========================= */
 client.once("ready", async () => {
-  console.log(`Bot online als ${client.user.tag}`);
-  STATE = freshDailyState(STATE);
-  saveState(STATE);
+  console.log(`Online als ${client.user.tag}`);
 
-  // Cron Jobs
-  cron.schedule(config.cron.dailyPost, async () => {
-    try {
-      STATE = loadState();
-      await startDailyReview(STATE, "cron");
-    } catch (e) {
-      console.error("dailyPost error:", e);
-    }
-  });
+  // register slash commands
+  try {
+    await registerCommands();
+    console.log("Slash Commands registriert: /news");
+  } catch (e) {
+    console.error("Command registration failed:", e.message);
+  }
 
-  cron.schedule(config.cron.reminder1, async () => {
-    try {
-      STATE = loadState(); STATE = freshDailyState(STATE);
-      if (!STATE.daily.reminder.r1) {
-        await sendReminderDM(STATE, 1);
-        STATE.daily.reminder.r1 = true;
-        saveState(STATE);
+  // initial run
+  await postAllRegions();
 
-        if (config.behavior.pingReviewerInChannelOnReminders) {
-          await maybePingInChannel(`<@${config.reviewerUserId}> Reminder: Daily Review ist noch offen.`);
-        }
-      }
-    } catch (e) {
-      console.error("reminder1 error:", e);
-    }
-  });
-
-  cron.schedule(config.cron.reminder2, async () => {
-    try {
-      STATE = loadState(); STATE = freshDailyState(STATE);
-      if (!STATE.daily.reminder.r2) {
-        await sendReminderDM(STATE, 2);
-        STATE.daily.reminder.r2 = true;
-        saveState(STATE);
-
-        if (config.behavior.pingReviewerInChannelOnReminders) {
-          await maybePingInChannel(`<@${config.reviewerUserId}> Reminder: Daily Review ist noch offen.`);
-        }
-      }
-    } catch (e) {
-      console.error("reminder2 error:", e);
-    }
-  });
-
-  cron.schedule(config.cron.reminder3, async () => {
-    try {
-      STATE = loadState(); STATE = freshDailyState(STATE);
-      if (!STATE.daily.reminder.r3) {
-        await sendReminderDM(STATE, 3);
-        STATE.daily.reminder.r3 = true;
-        saveState(STATE);
-
-        if (config.behavior.pingReviewerInChannelOnReminders) {
-          await maybePingInChannel(`<@${config.reviewerUserId}> Letzter Reminder heute.`);
-        }
-      }
-    } catch (e) {
-      console.error("reminder3 error:", e);
-    }
-  });
-
-  cron.schedule(config.cron.autoClose, async () => {
-    try {
-      STATE = loadState();
-      await autoCloseIfOpen(STATE);
-    } catch (e) {
-      console.error("autoClose error:", e);
-    }
+  // schedule
+  cron.schedule(CONFIG.schedule, async () => {
+    await postAllRegions();
   });
 });
 
 client.on("interactionCreate", async (interaction) => {
-  try {
-    // Select Menus (Antworten)
-    if (interaction.isStringSelectMenu()) {
-      // Hard-Security: Channel + User + CustomId Format
-      if (interaction.channelId !== config.reviewChannelId) {
-        return interaction.reply({ content: "❌ Nicht erlaubt (falscher Channel).", ephemeral: true });
-      }
-      if (!isReviewer(interaction.user.id)) {
-        return interaction.reply({ content: "❌ Nicht erlaubt (falscher User).", ephemeral: true });
-      }
-      if (!interaction.customId.startsWith("review_")) {
-        return interaction.reply({ content: "❌ Ungültige Interaktion.", ephemeral: true });
-      }
+  if (!interaction.isChatInputCommand()) return;
+  if (interaction.commandName !== "news") return;
 
-      STATE = loadState();
-      STATE = freshDailyState(STATE);
+  const region = (interaction.options.getString("region") || "ALL").toUpperCase();
+  await interaction.reply({ content: "Alles klar. Ich poste jetzt die neuesten Embeds.", ephemeral: true });
 
-      const d = STATE.daily;
-      if (!d.started || d.completed) {
-        return interaction.reply({ content: "⚠️ Heute ist keine aktive Review offen.", ephemeral: true });
-      }
-
-      const idx = Number(interaction.customId.split("_")[1]);
-      if (!Number.isInteger(idx) || idx < 0 || idx >= QUESTIONS.length) {
-        return interaction.reply({ content: "❌ Ungültige Frage.", ephemeral: true });
-      }
-
-      const value = clamp1to5(interaction.values?.[0]);
-      if (!value) {
-        return interaction.reply({ content: "❌ Ungültiger Wert.", ephemeral: true });
-      }
-
-      d.answers[idx] = value;
-      saveState(STATE);
-
-      const answered = d.answers.filter(v => v !== null).length;
-      await interaction.reply({
-        content: `✅ Gespeichert: ${stars(value)} (${value}/5) — Fortschritt: ${answered}/${QUESTIONS.length}`,
-        ephemeral: true
-      });
-
-      await completeIfReady(STATE);
-      return;
-    }
-
-    // Slash Commands
-    if (interaction.isChatInputCommand() && interaction.commandName === "review") {
-      if (!isReviewer(interaction.user.id)) {
-        return interaction.reply({ content: "❌ Nicht erlaubt.", ephemeral: true });
-      }
-      if (interaction.guildId !== config.guildId) {
-        return interaction.reply({ content: "❌ Falscher Server.", ephemeral: true });
-      }
-
-      const sub = interaction.options.getSubcommand();
-      STATE = loadState();
-      STATE = freshDailyState(STATE);
-
-      if (sub === "start") {
-        const res = await startDailyReview(STATE, "manual");
-        if (!res.ok && res.reason === "already_started") {
-          return interaction.reply({ content: "⚠️ Heute läuft bereits eine Review.", ephemeral: true });
-        }
-        return interaction.reply({ content: "✅ Review gestartet.", ephemeral: true });
-      }
-
-      if (sub === "status") {
-        const d = STATE.daily;
-        const answered = d.answers.filter(v => v !== null).length;
-        const missingIdx = d.answers
-          .map((v, i) => (v === null ? i : null))
-          .filter(v => v !== null);
-
-        const embed = new EmbedBuilder()
-          .setTitle("📌 Review Status")
-          .setDescription(
-            [
-              `Datum: **${d.date}**`,
-              `Gestartet: **${d.started ? "Ja" : "Nein"}**`,
-              `Abgeschlossen: **${d.completed ? "Ja" : "Nein"}**`,
-              `Fortschritt: **${answered}/${QUESTIONS.length}**`,
-              "",
-              missingIdx.length
-                ? `Offen:\n${missingIdx.map(i => `• Frage ${i + 1}`).join("\n")}`
-                : "Alles beantwortet."
-            ].join("\n")
-          )
-          .setColor(0x2196F3)
-          .setTimestamp();
-
-        return interaction.reply({ embeds: [embed], ephemeral: true });
-      }
-
-      if (sub === "reset") {
-        // Reset nur für heute
-        const key = todayKey();
-        STATE.daily = {
-          date: key,
-          started: false,
-          completed: false,
-          startedAt: null,
-          completedAt: null,
-          answers: Array(QUESTIONS.length).fill(null),
-          messages: {
-            introMessageId: null,
-            questionMessageIds: Array(QUESTIONS.length).fill(null)
-          },
-          reminder: { r1: false, r2: false, r3: false }
-        };
-        saveState(STATE);
-
-        return interaction.reply({ content: "✅ Heutige Review zurückgesetzt.", ephemeral: true });
-      }
-    }
-  } catch (e) {
-    console.error("interaction error:", e);
-    if (interaction.isRepliable()) {
-      try {
-        await interaction.reply({ content: "⚠️ Fehler im System.", ephemeral: true });
-      } catch {}
-    }
+  if (region === "ALL") {
+    await postAllRegions();
+    return;
   }
+
+  if (!CONFIG.channels[region]) {
+    await interaction.followUp({ content: `Unbekannte Region: ${region}. Nutze DE/IT/ES/UK/NATO/GR/HR oder ALL.`, ephemeral: true });
+    return;
+  }
+
+  await postRegion(region);
 });
 
-client.login(config.token);
+client.login(CONFIG.token);
